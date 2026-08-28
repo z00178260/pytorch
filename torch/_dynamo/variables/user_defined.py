@@ -5711,3 +5711,79 @@ class SimpleNamespaceVariable(UserDefinedObjectVariable):
         if not isinstance(other, SimpleNamespaceVariable):
             return variables.ConstantVariable.create(NotImplemented)
         return self.get_dict_vt(tx).tp_richcompare_impl(tx, other.get_dict_vt(tx), op)
+    NPU_TENSOR_TYPES = (
+    "FloatTensor",
+    "DoubleTensor",
+    "HalfTensor",
+    "BFloat16Tensor",
+    "ByteTensor",
+    "CharTensor",
+    "IntTensor",
+    "ShortTensor",
+    "LongTensor",
+)
+
+_original_in_graph_classes = None
+
+
+def _get_npu_extended_in_graph_classes() -> set:
+    original_classes = UserDefinedClassVariable._in_graph_classes()
+
+    if not hasattr(torch, "npu"):
+        return original_classes
+
+    for tensor_type_name in NPU_TENSOR_TYPES:
+        tensor_cls = getattr(torch.npu, tensor_type_name, None)
+        if tensor_cls is not None:
+            original_classes.add(tensor_cls)
+
+    if hasattr(torch.npu, "Stream"):
+        original_classes.add(torch.npu.Stream)
+
+    if hasattr(torch.npu, "Event"):
+        original_classes.add(torch.npu.Event)
+
+    return original_classes
+
+
+def apply_npu_dynamo_patch() -> None:
+    global _original_in_graph_classes
+
+    if hasattr(UserDefinedClassVariable, "_npu_patch_original"):
+        return
+
+    _original_in_graph_classes = UserDefinedClassVariable._in_graph_classes
+    UserDefinedClassVariable._npu_patch_original = staticmethod(_original_in_graph_classes)
+
+    extended_func = staticmethod(_get_npu_extended_in_graph_classes)
+
+    if hasattr(_original_in_graph_classes, "cache_info"):
+        extended_func.cache_info = _original_in_graph_classes.cache_info
+        extended_func.cache_clear = _original_in_graph_classes.cache_clear
+
+    UserDefinedClassVariable._in_graph_classes = extended_func
+
+    try:
+        UserDefinedClassVariable._in_graph_classes.cache_clear()
+    except AttributeError:
+        pass
+
+
+def remove_npu_dynamo_patch() -> None:
+    global _original_in_graph_classes
+
+    if hasattr(UserDefinedClassVariable, "_npu_patch_original"):
+        UserDefinedClassVariable._in_graph_classes = (
+            UserDefinedClassVariable._npu_patch_original
+        )
+
+        try:
+            UserDefinedClassVariable._in_graph_classes.cache_clear()
+        except AttributeError:
+            pass
+
+        delattr(UserDefinedClassVariable, "_npu_patch_original")
+
+
+def is_npu_patch_applied() -> bool:
+    return hasattr(UserDefinedClassVariable, "_npu_patch_original")
