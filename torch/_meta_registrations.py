@@ -7568,9 +7568,27 @@ def upsample_nearest2d(input, output_size, scales_h=None, scales_w=None):
     # convert output to correct memory format, if necessary
     memory_format = utils.suggest_memory_format(input)
 
-    # following "heuristic: only use channels_last path when it's faster than the contiguous path"
+    # following "heuristic: only use the channels_last path when it's faster
+    # than the contiguous path"
+    #
+    # Note [upsample memory-format contract]: with channels_last input, the
+    # CUDA kernel and the registered PrivateUse1 backend write into a flat
+    # contiguous buffer, so the output strides are contiguous regardless of
+    # the input format; CPU preserves the input's layout (verified on device
+    # for the registered backend). This meta kernel serves FakeTensor shape
+    # inference, so the device must be read through device_hint() — plain
+    # input.device.type reports "meta" for fake tensors. device_hint() also
+    # defaults to "cuda" for plain (non-fake) meta tensors, so unlike the
+    # pre-change device.type check, plain meta tensors now follow the
+    # accelerator branch; this matches the semantics of _pad2d_common and
+    # meta tensors have no real device anyway. It must stay in sync with the
+    # same heuristic in _upsample_nearest (torch/_decomp/decompositions.py),
+    # which serves tracing/export.
     _, n_channels, _, _ = input.shape
-    if input.device.type == "cuda" and n_channels < 4:
+    if (
+        device_hint(input) == "cuda"
+        or device_hint(input) == torch._C._get_privateuse1_backend_name()
+    ) and n_channels < 4:
         memory_format = torch.contiguous_format
 
     output = output.contiguous(memory_format=memory_format)

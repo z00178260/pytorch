@@ -755,6 +755,73 @@ class TestDecomp(TestCase):
         )
         self.assertEqual(shape, res[0].shape)
 
+    @onlyCPU
+    def test_upsample_nearest_memory_format_matches_kernels(self, device):
+        # Note [upsample memory-format contract]: with channels_last input,
+        # accelerator kernels (CUDA, and the registered PrivateUse1 backend)
+        # write into a flat contiguous buffer, so the output strides are
+        # contiguous; CPU preserves the input's channels_last layout. The
+        # FakeTensor path is served by the meta kernel of upsample_nearest2d
+        # (which must read the device through device_hint, since fake tensors
+        # report "meta" inside meta kernels), and tracing/export by the
+        # _upsample_nearest decomposition — both must report the same output
+        # strides as the real kernels, otherwise torch.compile/export diverge
+        # from eager. All assertions pivot on fake devices and are independent
+        # of the injected `device`; the channels_last input is built with
+        # as_strided (pure view ops) so it works on fake devices with no
+        # registered backend module.
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        privateuse1 = torch._C._get_privateuse1_backend_name()
+        # channels_last strides for shape (1, 3, 4, 4)
+        cl_strides = (48, 1, 12, 3)
+
+        def channels_last_input(device_name):
+            x = torch.empty(1, 3, 4, 4, device=device_name)
+            x = x.as_strided((1, 3, 4, 4), cl_strides)
+            self.assertTrue(x.is_contiguous(memory_format=torch.channels_last))
+            return x
+
+        with FakeTensorMode():
+            for dev, expect_contiguous in (
+                ("cpu", False),
+                ("cuda", True),
+                (f"{privateuse1}:0", True),
+            ):
+                out = torch.ops.aten.upsample_nearest2d(
+                    channels_last_input(dev), [8, 8], None
+                )
+                self.assertEqual(
+                    out.is_contiguous(),
+                    expect_contiguous,
+                    msg=f"upsample_nearest2d meta on {dev}",
+                )
+                # contig input stays contiguous everywhere
+                out2 = torch.ops.aten.upsample_nearest2d(
+                    torch.empty(1, 3, 4, 4, device=f"{dev}:0"), [8, 8], None
+                )
+                self.assertTrue(
+                    out2.is_contiguous(), msg=f"upsample_nearest2d contig on {dev}"
+                )
+
+        # The decomposition (tracing/export path) must agree with the meta
+        # kernel above on every device.
+        from torch._dispatch.python import enable_python_dispatcher
+
+        with enable_python_dispatcher(), FakeTensorMode():
+            for dev, expect_contiguous in (
+                ("cpu", False),
+                (f"{privateuse1}:0", True),
+            ):
+                out = torch.ops.aten.upsample_nearest2d(
+                    channels_last_input(dev), [8, 8], None
+                )
+                self.assertEqual(
+                    out.is_contiguous(),
+                    expect_contiguous,
+                    msg=f"upsample_nearest2d decomp on {dev}",
+                )
+
     def test_batch_norm_eval_emits_rsqrt(self, device):
         # The eval/inference branch of native_batch_norm_helper computes the
         # inverse std as rsqrt(running_var + eps), matching the training branch,

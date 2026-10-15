@@ -3800,9 +3800,27 @@ def _upsample_nearest(
         # convert output to correct memory format, if necessary
         memory_format = utils.suggest_memory_format(input)
 
-        # following "heuristic: only use channels_last path when it's faster than the contiguous path"
+        # following "heuristic: only use the channels_last path when it's
+        # faster than the contiguous path"
+        #
+        # Note [upsample memory-format contract]: with channels_last input,
+        # the CUDA kernel and the registered PrivateUse1 backend write into
+        # a flat contiguous buffer with linear indexing, so the output strides
+        # are contiguous regardless of the input format; CPU preserves the
+        # input's layout (verified on device for the registered backend).
+        # This decomposition serves tracing/export and must stay in sync with
+        # the same heuristic in upsample_nearest2d
+        # (torch/_meta_registrations.py), which serves FakeTensor shape
+        # inference — both must report the same output strides, otherwise
+        # torch.compile/export diverge from eager.
         n_channels = input.shape[1]
-        if result.ndim == 4 and input.device.type == "cuda" and n_channels < 4:
+        private_backend = torch._C._get_privateuse1_backend_name()
+        if (
+            result.ndim == 4
+            and (input.device.type == "cuda"
+                 or input.device.type == private_backend)
+            and n_channels < 4
+        ):
             memory_format = torch.contiguous_format
 
         result = result.contiguous(memory_format=memory_format)
