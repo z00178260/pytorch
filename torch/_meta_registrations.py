@@ -2326,9 +2326,14 @@ def _pad2d_common(input, padding, *, is_reflection):
     else:
         output = input.new_empty((nbatch, nplane, output_h, output_w))
         # CPU kernels preserve channels_last via suggest_memory_format(),
-        # but CUDA kernels always produce contiguous output.
+        # but accelerator kernels (CUDA, and the registered PrivateUse1
+        # backend) always produce contiguous output (verified on device for
+        # the registered backend). The decomposition
+        # (_reflection_or_replication_pad in torch/_decomp/decompositions.py)
+        # encodes the same contract and must stay in sync.
         if (
             device_hint(input) != "cuda"
+            and device_hint(input) != torch._C._get_privateuse1_backend_name()
             and utils.suggest_memory_format(input) == torch.channels_last
         ):
             output = output.to(memory_format=torch.channels_last)

@@ -5550,7 +5550,15 @@ def _reflection_or_replication_pad(
     #         preserving the input's format (e.g. channels_last).
     #   CUDA/XPU/MPS: kernel writes to a flat contiguous buffer with linear indexing,
     #         always producing contiguous output regardless of input format.
-    if a.device.type in ("cuda", "mps", "xpu"):
+    # The registered PrivateUse1 backend behaves like the accelerators here
+    # (verified on device: channels_last input yields contiguous output), so
+    # it joins the contiguous branch. This decomposition must stay in sync
+    # with the same contract in _pad2d_common (torch/_meta_registrations.py),
+    # which serves FakeTensor shape inference.
+    if (
+        a.device.type in ("cuda", "mps", "xpu")
+        or a.device.type == torch._C._get_privateuse1_backend_name()
+    ):
         memory_format = torch.contiguous_format
     else:
         memory_format = utils.suggest_memory_format(a)

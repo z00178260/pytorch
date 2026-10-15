@@ -755,6 +755,105 @@ class TestDecomp(TestCase):
         )
         self.assertEqual(shape, res[0].shape)
 
+    @onlyCPU
+    def test_pad_memory_format_matches_kernels(self, device):
+        # Note [pad memory-format contract]: with channels_last input, the
+        # accelerator kernels (CUDA/XPU/MPS, and the registered PrivateUse1
+        # backend) write into a flat contiguous buffer, so the output strides
+        # are contiguous; CPU preserves the input's channels_last layout.
+        # The FakeTensor path is served by the _pad2d_common meta kernel
+        # (which must read the device through device_hint), and tracing/export
+        # by the _reflection_or_replication_pad decomposition — both must
+        # report the same output strides as the real kernels, otherwise
+        # torch.compile/export diverge from eager. All assertions pivot on
+        # fake devices and are independent of the injected `device`; the
+        # channels_last input is built with as_strided (pure view ops) so it
+        # works on fake devices with no registered backend module.
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        privateuse1 = torch._C._get_privateuse1_backend_name()
+        # channels_last strides for shape (1, 3, 4, 4)
+        cl_strides = (48, 1, 12, 3)
+
+        def channels_last_input(device_name):
+            x = torch.empty(1, 3, 4, 4, device=device_name)
+            x = x.as_strided((1, 3, 4, 4), cl_strides)
+            self.assertTrue(x.is_contiguous(memory_format=torch.channels_last))
+            return x
+
+        with FakeTensorMode():
+            for dev, expect_contiguous in (
+                ("cpu", False),
+                ("cuda", True),
+                (f"{privateuse1}:0", True),
+            ):
+                for op in (
+                    torch.ops.aten.reflection_pad2d,
+                    torch.ops.aten.replication_pad2d,
+                ):
+                    out = op(channels_last_input(dev), [1, 1, 1, 1])
+                    self.assertEqual(
+                        out.is_contiguous(),
+                        expect_contiguous,
+                        msg=f"{op} meta on {dev}",
+                    )
+
+        # The decomposition (tracing/export path) must agree with the meta
+        # kernel above on every device.
+        from torch._dispatch.python import enable_python_dispatcher
+
+        with enable_python_dispatcher(), FakeTensorMode():
+            for dev, expect_contiguous in (
+                ("cpu", False),
+                (f"{privateuse1}:0", True),
+            ):
+                for op in (
+                    torch.ops.aten.reflection_pad2d,
+                    torch.ops.aten.replication_pad2d,
+                ):
+                    out = op(channels_last_input(dev), [1, 1, 1, 1])
+                    self.assertEqual(
+                        out.is_contiguous(),
+                        expect_contiguous,
+                        msg=f"{op} decomp on {dev}",
+                    )
+
+        # 3D pad: the decomposition covers 1d/2d/3d, but on the meta side only
+        # _pad2d_common has a memory-format branch — _pad3d_common always
+        # returns contiguous. For the accelerators (cuda and the registered
+        # PrivateUse1 backend) both the meta kernel and the decomposition yield
+        # contiguous, so there is no divergence on the 3D path either. CPU's 3D
+        # behavior is pre-existing and left untouched, so it is not asserted.
+        cl3d_strides = (192, 1, 48, 12, 3)  # channels_last_3d for (1, 3, 4, 4, 4)
+
+        def channels_last_3d_input(device_name):
+            x = torch.empty(1, 3, 4, 4, 4, device=device_name)
+            x = x.as_strided((1, 3, 4, 4, 4), cl3d_strides)
+            self.assertTrue(x.is_contiguous(memory_format=torch.channels_last_3d))
+            return x
+
+        with FakeTensorMode():
+            for dev in ("cuda", f"{privateuse1}:0"):
+                for op in (
+                    torch.ops.aten.reflection_pad3d,
+                    torch.ops.aten.replication_pad3d,
+                ):
+                    out = op(channels_last_3d_input(dev), [1, 1, 1, 1, 1, 1])
+                    self.assertTrue(
+                        out.is_contiguous(), msg=f"{op} meta 3d on {dev}"
+                    )
+
+        with enable_python_dispatcher(), FakeTensorMode():
+            for dev in (f"{privateuse1}:0",):
+                for op in (
+                    torch.ops.aten.reflection_pad3d,
+                    torch.ops.aten.replication_pad3d,
+                ):
+                    out = op(channels_last_3d_input(dev), [1, 1, 1, 1, 1, 1])
+                    self.assertTrue(
+                        out.is_contiguous(), msg=f"{op} decomp 3d on {dev}"
+                    )
+
     def test_batch_norm_eval_emits_rsqrt(self, device):
         # The eval/inference branch of native_batch_norm_helper computes the
         # inverse std as rsqrt(running_var + eps), matching the training branch,
