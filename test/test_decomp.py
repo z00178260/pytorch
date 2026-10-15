@@ -755,6 +755,53 @@ class TestDecomp(TestCase):
         )
         self.assertEqual(shape, res[0].shape)
 
+    @onlyCPU
+    def test_upsample_bilinear_memory_format_matches_kernels(self, device):
+        # Note [upsample memory-format contract]: with channels_last input,
+        # accelerator kernels (CUDA, and the registered PrivateUse1 backend)
+        # write into a flat contiguous buffer, so the output strides are
+        # contiguous; CPU preserves the input's channels_last layout.
+        # upsample_bilinear2d has no meta kernel, so this decomposition is
+        # what FakeTensor shape inference runs — its memory_format choice must
+        # match the real kernels' output strides, otherwise torch.compile and
+        # export diverge from eager. All assertions pivot on fake devices and
+        # are independent of the injected `device`; the channels_last input is
+        # built with as_strided (pure view ops) so it works on fake devices
+        # with no registered backend module.
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        privateuse1 = torch._C._get_privateuse1_backend_name()
+        # channels_last strides for shape (1, 3, 4, 4)
+        cl_strides = (48, 1, 12, 3)
+
+        def channels_last_input(device_name):
+            x = torch.empty(1, 3, 4, 4, device=device_name)
+            x = x.as_strided((1, 3, 4, 4), cl_strides)
+            self.assertTrue(x.is_contiguous(memory_format=torch.channels_last))
+            return x
+
+        with FakeTensorMode():
+            for dev, expect_contiguous in (
+                ("cpu", False),
+                ("cuda", True),
+                (f"{privateuse1}:0", True),
+            ):
+                out = torch.ops.aten.upsample_bilinear2d(
+                    channels_last_input(dev), [8, 8], None, False
+                )
+                self.assertEqual(
+                    out.is_contiguous(),
+                    expect_contiguous,
+                    msg=f"upsample_bilinear2d on {dev}",
+                )
+                # contig input stays contiguous everywhere
+                out2 = torch.ops.aten.upsample_bilinear2d(
+                    torch.empty(1, 3, 4, 4, device=f"{dev}:0"), [8, 8], None, False
+                )
+                self.assertTrue(
+                    out2.is_contiguous(), msg=f"upsample_bilinear2d contig on {dev}"
+                )
+
     def test_batch_norm_eval_emits_rsqrt(self, device):
         # The eval/inference branch of native_batch_norm_helper computes the
         # inverse std as rsqrt(running_var + eps), matching the training branch,
