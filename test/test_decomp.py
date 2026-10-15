@@ -755,6 +755,59 @@ class TestDecomp(TestCase):
         )
         self.assertEqual(shape, res[0].shape)
 
+    def test_addmm_activation_gelu_approximation_registry(self, device):
+        # _addmm_activation picks the GELU approximation of the eager aten.gelu
+        # kernel for each device: tanh on CUDA, exact elsewhere. The choice is
+        # consulted through a registry so registered PrivateUse1 backends whose
+        # eager kernel uses tanh can opt in via
+        # register_eager_gelu_approximation() instead of the decomp guessing.
+        # Only registered device types route to tanh; unregistered ones (and
+        # CPU) keep the exact GELU, so torch.compile output metadata (shape,
+        # dtype, strides) is identical on every device — only the numerics of
+        # the approximation follow the backend's eager kernel.
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from torch._dispatch.python import enable_python_dispatcher
+
+        from torch._decomp.decompositions import (
+            _EAGER_GELU_APPROXIMATION,
+            register_eager_gelu_approximation,
+        )
+
+        self.assertEqual(_EAGER_GELU_APPROXIMATION.get("cuda"), "tanh")
+        self.assertIsNone(_EAGER_GELU_APPROXIMATION.get("cpu"))
+
+        def fake_out(device_type):
+            with enable_python_dispatcher(), FakeTensorMode():
+                self_ = torch.randn(4, device=f"{device_type}:0")
+                mat1 = torch.randn(2, 8, device=f"{device_type}:0")
+                mat2 = torch.randn(8, 4, device=f"{device_type}:0")
+                return torch.ops.aten._addmm_activation(
+                    self_, mat1, mat2, use_gelu=True
+                )
+
+        # Unregistered device: exact-GELU path, same metadata as before.
+        # Resolved at runtime so any PrivateUse1 device-tree name is
+        # covered too, mirroring the fake-device coverage pattern of the
+        # log_sigmoid_forward buffer-shape test.
+        privateuse1 = torch._C._get_privateuse1_backend_name()
+        for unregistered in ("cpu", privateuse1):
+            out = fake_out(unregistered)
+            self.assertEqual(out.shape, torch.Size([2, 4]))
+            self.assertEqual(out.device.type, unregistered)
+
+        # A registered backend opts in: register the PrivateUse1 backend name
+        # itself (the real opt-in scenario — a backend declaring its own eager
+        # approximation at import time), and the registry lookup now routes it
+        # to tanh. The decomp stays metadata-neutral, so the fake output keeps
+        # valid shape/dtype/strides regardless of the approximation.
+        try:
+            register_eager_gelu_approximation(privateuse1, "tanh")
+            self.assertEqual(_EAGER_GELU_APPROXIMATION.get(privateuse1), "tanh")
+            out = fake_out(privateuse1)
+            self.assertEqual(out.shape, torch.Size([2, 4]))
+        finally:
+            _EAGER_GELU_APPROXIMATION.pop(privateuse1, None)
+
     def test_batch_norm_eval_emits_rsqrt(self, device):
         # The eval/inference branch of native_batch_norm_helper computes the
         # inverse std as rsqrt(running_var + eps), matching the training branch,
