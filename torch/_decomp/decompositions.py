@@ -4659,8 +4659,22 @@ def _upsample_linear(
     # convert output to correct memory format, if necessary
     memory_format = utils.suggest_memory_format(input)
 
-    # following "heuristic: only use channels_last path when it's faster than the contiguous path"
-    if input.device.type == "cuda" and n_channels < 16:
+    # following "heuristic: only use the channels_last path when it's faster
+    # than the contiguous path"
+    #
+    # Note [upsample memory-format contract]: with channels_last input, the
+    # CUDA kernel and the registered PrivateUse1 backend write into a flat
+    # contiguous buffer, so the output strides are contiguous regardless of
+    # the input format; CPU preserves the input's layout (verified on device
+    # for the registered backend). There is no separate Meta registration for
+    # upsample_bilinear2d, so this decomposition is what FakeTensor shape
+    # inference runs — the memory_format chosen here must match the real
+    # kernels' output strides, otherwise torch.compile/export diverge from
+    # eager.
+    private_backend = torch._C._get_privateuse1_backend_name()
+    if (
+        input.device.type == "cuda" or input.device.type == private_backend
+    ) and n_channels < 16:
         memory_format = torch.contiguous_format
 
     if not isinstance(result, torch.Tensor):
